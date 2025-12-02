@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>行動値型ゲームスケジューラ (ローカル保存)</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <style>
+        /* カスタムスタイルとアニメーション */
+        :root {
+            --color-urgent: #ef4444;    /* Red 500 */
+            --color-important: #f97316; /* Orange 500 */
+            --color-normal: #facc15;    /* Amber 400 */
+            --color-low: #f3f4f6;       /* Gray 100 */
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1f2937; /* Dark background for game feel */
+        }
+        .task-block {
+            transition: all 0.5s ease-in-out, transform 0.3s ease-out; /* 移動と浮き上がりアニメーション */
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+            cursor: pointer;
+            position: relative;
+        }
+        /* 行動値に応じた色分け */
+        .color-0 { background-color: #dc2626; color: white; } /* Overdue (Deep Red) */
+        .color-1 { background-color: var(--color-urgent); color: white; } /* High Priority (Red) */
+        .color-2 { background-color: var(--color-important); color: white; } /* Medium Priority (Orange) */
+        .color-3 { background-color: var(--color-normal); color: #1f2937; } /* Normal Priority (Yellow) */
+        .color-4 { background-color: var(--color-low); color: #1f2937; } /* Low Priority (White/Gray) */
+
+        /* 浮き上がりアニメーション (移動時) */
+        .task-block.is-moving {
+            transform: scale(1.02) translateY(-5px);
+            z-index: 10;
+        }
+
+        /* スケジュール詳細モーダル */
+        .modal-overlay {
+            background-color: rgba(0, 0, 0, 0.7);
+            z-index: 50;
+        }
+        .modal-content {
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body class="min-h-screen">
+    <!-- インメモリ + LocalStorageロジック -->
+    <script>
+        // --- グローバル変数 ---
+        let tasks = [];     // タスクを保存する配列
+        let nextId = 1;     // タスクID用カウンタ
+        let updateInterval = null;
+        const STORAGE_KEY = 'actionValueScheduler_tasks_v1'; // ローカルストレージのキー
+
+        // グローバル関数として公開
+        window.initializeLocalApp = initializeLocalApp;
+        window.refreshTaskView = refreshTaskView;
+        window.addNewTask = addNewTask;
+        window.deleteTask = deleteTask;
+        window.completeTask = completeTask;
+        window.snoozeTask = snoozeTask;
+        window.calculateActionValue = calculateActionValue;
+        window.saveData = saveData; // 保存用関数
+
+        /**
+         * アプリの初期化
+         */
+        function initializeLocalApp() {
+            const userIdDisplay = document.getElementById('user-id-display');
+            const loadingMsg = document.getElementById('initial-loading-message');
+            
+            if (userIdDisplay) {
+                userIdDisplay.textContent = 'Status: ローカル保存モード (ブラウザに保存中)';
+            }
+
+            // --- データのロード処理 ---
+            const savedData = localStorage.getItem(STORAGE_KEY);
+            if (savedData) {
+                try {
+                    tasks = JSON.parse(savedData);
+                    // IDの整合性を保つため、最大のIDを探してnextIdを更新
+                    if (tasks.length > 0) {
+                        // 文字列IDが混ざる可能性を考慮して数値変換
+                        const maxId = Math.max(...tasks.map(t => Number(t.id)));
+                        if (!isNaN(maxId)) {
+                            nextId = maxId + 1;
+                        }
+                    }
+                } catch (e) {
+                    console.error("データの読み込みに失敗しました", e);
+                    tasks = [];
+                }
+            }
+            // -----------------------
+            
+            // 初回描画
+            refreshTaskView();
+
+            // ローディングメッセージを適切なものに変更
+            if (loadingMsg) {
+                if (tasks.length === 0) {
+                    loadingMsg.textContent = 'タスクはまだありません。右下のボタンからスケジュールを追加しましょう！';
+                    loadingMsg.classList.remove('text-red-400');
+                    loadingMsg.classList.add('text-gray-400');
+                    loadingMsg.classList.remove('hidden');
+                } else {
+                    loadingMsg.classList.add('hidden');
+                }
+            }
+
+            // 1分ごとにタスクの行動値（残り時間に基づく）を再計算して表示更新
+            if (updateInterval) clearInterval(updateInterval);
+            updateInterval = setInterval(refreshTaskView, 60000);
+        }
+
+        /**
+         * データをローカルストレージに保存
+         */
+        function saveData() {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+                console.log("データを保存しました");
+            } catch (e) {
+                console.error("保存に失敗しました（容量オーバーなどの可能性があります）", e);
+                showTemporaryMessage("保存に失敗しました", "bg-red-500");
+            }
+        }
+
+        /**
+         * 30分単位で時間を丸め、行動値を計算する関数
+         */
+        function calculateActionValue(importance, deadline, boostValue = 0) {
+            const now = new Date();
+            const timeDiffMs = deadline.getTime() - now.getTime();
+            // 分単位での残り時間
+            let T_minutes = timeDiffMs / (1000 * 60); 
+
+            // --- 30分単位の丸め処理 (四捨五入) ---
+            let T_rounded_minutes = Math.round(T_minutes / 30) * 30;
+
+            // 丸められた時間を時間単位 T に変換
+            const T = T_rounded_minutes / 60; 
+
+            let actionValue;
+
+            if (T < 0) {
+                // 遅延したタスク
+                const T_abs = Math.abs(T);
+                actionValue = (-10000 * (1 + T_abs)) - importance + boostValue;
+            } else {
+                // 期限内のタスク
+                actionValue = (100 - importance) * (T + 1) + boostValue;
+            }
+            
+            return Math.round(actionValue * 10) / 10;
+        }
+
+        /**
+         * タスクリストの再計算と表示更新
+         */
+        function refreshTaskView() {
+            const now = new Date();
+            let hasChanges = false;
+
+            // 1. 各タスクの行動値を再計算
+            tasks.forEach(task => {
+                // スヌーズ期限切れチェック
+                if (task.snoozeUntil && new Date(task.snoozeUntil) <= now) {
+                    task.boostValue = 0;
+                    task.snoozeUntil = null;
+                    hasChanges = true; // 状態が変わったので保存が必要
+                }
+                
+                // Dateオブジェクトであることを保証
+                const deadlineDate = new Date(task.deadline);
+                task.actionValue = calculateActionValue(task.importance, deadlineDate, task.boostValue || 0);
+            });
+
+            if (hasChanges) {
+                saveData(); // スヌーズ解除などを保存
+            }
+
+            // 2. 行動値が小さい順にソート
+            tasks.sort((a, b) => a.actionValue - b.actionValue);
+
+            // 3. 描画
+            renderTasks(tasks);
+
+            // 4. 空状態の表示制御
+            const loadingMessage = document.getElementById('initial-loading-message');
+            if (loadingMessage) {
+                if (tasks.length === 0) {
+                    loadingMessage.classList.remove('hidden');
+                } else {
+                    loadingMessage.classList.add('hidden');
+                }
+            }
+        }
+
+        /**
+         * HTMLレンダリング
+         */
+        function renderTasks(sortedTasks) {
+            const container = document.getElementById('task-list');
+            if (!container) return;
+
+            // アニメーション判定用
+            const currentElements = Array.from(container.children);
+            const currentTaskIds = currentElements.map(el => el.dataset.taskId).filter(id => id);
+
+            let html = '';
+
+            sortedTasks.forEach((task, index) => {
+                const taskIdStr = String(task.id);
+                const isMoving = currentTaskIds[index] !== taskIdStr && currentTaskIds.includes(taskIdStr);
+
+                // 色分け
+                let colorClass;
+                if (task.actionValue < 0) colorClass = 'color-0';      // Overdue
+                else if (task.actionValue < 50) colorClass = 'color-1'; // High
+                else if (task.actionValue < 200) colorClass = 'color-2'; // Mid
+                else if (task.actionValue < 500) colorClass = 'color-3'; // Normal
+                else colorClass = 'color-4'; // Low
+
+                // 残り時間表示計算
+                const timeDiffMs = new Date(task.deadline).getTime() - new Date().getTime();
+                const T_minutes = timeDiffMs / (1000 * 60);
+                const T_rounded_minutes = Math.round(T_minutes / 30) * 30;
+                const T_hours = T_rounded_minutes / 60;
+
+                let timeRemainingStr;
+                if (T_hours < 0) {
+                    const totalHoursOverdue = Math.abs(T_hours);
+                    const daysOverdue = Math.floor(totalHoursOverdue / 24);
+                    const hoursOverdue = Math.round((totalHoursOverdue % 24) * 2) / 2;
+                    timeRemainingStr = `<span class="font-bold">遅延: ${daysOverdue}d ${hoursOverdue}h</span>`;
+                } else {
+                    const days = Math.floor(T_hours / 24);
+                    const hours = Math.round((T_hours % 24) * 2) / 2;
+                    timeRemainingStr = `${days}d ${hours}h`;
+                }
+
+                html += `
+                    <div 
+                        data-task-id="${task.id}" 
+                        data-action-value="${task.actionValue}"
+                        class="task-block ${colorClass} ${isMoving ? 'is-moving' : ''} p-4 mb-3 rounded-lg flex justify-between items-center transition-all duration-500 ease-in-out"
+                        onclick="window.showTaskDetail('${task.id}')"
+                    >
+                        <div class="text-lg font-extrabold w-1/5 text-center p-1 rounded-md bg-opacity-30">
+                            ${task.actionValue.toFixed(1)}
+                        </div>
+                        <div class="font-semibold text-base w-3/5 truncate px-2">
+                            ${task.name}
+                        </div>
+                        <div class="text-sm w-1/5 text-right flex-shrink-0">
+                            ${timeRemainingStr}
+                        </div>
+                    </div>
+                `;
+            });
+
+            container.innerHTML = html;
+
+            setTimeout(() => {
+                if(container) {
+                    Array.from(container.children).forEach(el => el.classList.remove('is-moving'));
+                }
+            }, 300);
+        }
+
+        /**
+         * タスク追加
+         */
+        function addNewTask(taskData) {
+            const newTask = {
+                id: nextId++,
+                name: taskData.name,
+                importance: taskData.importance,
+                deadline: taskData.deadline,
+                details: taskData.details || '',
+                boostValue: 0,
+                createdAt: new Date().toISOString()
+            };
+            
+            tasks.push(newTask);
+            saveData(); // 保存を実行
+            refreshTaskView();
+            window.hideAddModal();
+            showTemporaryMessage("タスクが追加されました！", "bg-green-500");
+        }
+
+        /**
+         * タスク削除
+         */
+        function deleteTask(taskId) {
+            const id = Number(taskId);
+            const initialLen = tasks.length;
+            tasks = tasks.filter(t => t.id !== id);
+
+            if (tasks.length < initialLen) {
+                saveData(); // 保存を実行
+                window.hideDetailModal();
+                refreshTaskView();
+                showTemporaryMessage("タスクがキャンセルされました", "bg-red-500");
+            }
+        }
+
+        /**
+         * タスク完了
+         */
+        function completeTask(taskId) {
+            deleteTask(taskId); // 現状は削除と同じ扱い
+            showTemporaryMessage("タスクを完了しました！お疲れ様です！", "bg-blue-500");
+        }
+
+        /**
+         * スヌーズ機能
+         */
+        function snoozeTask(taskId) {
+            const id = Number(taskId);
+            const task = tasks.find(t => t.id === id);
+            
+            if (task) {
+                task.boostValue = 3000;
+                task.snoozeUntil = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+                
+                saveData(); // 保存を実行
+                window.hideDetailModal();
+                refreshTaskView();
+                showTemporaryMessage("タスクを2時間スヌーズしました。", "bg-yellow-500");
+            }
+        }
+
+        // --- 汎用・UI制御 ---
+
+        function showTemporaryMessage(message, bgColor) {
+            const container = document.getElementById('message-container');
+            if (!container) return;
+            
+            container.textContent = message;
+            container.className = `fixed top-0 left-1/2 transform -translate-x-1/2 ${bgColor} text-white px-4 py-2 rounded-b-lg shadow-lg transition-all duration-300 z-50`;
+            container.style.opacity = '1';
+            
+            setTimeout(() => {
+                container.style.opacity = '0';
+            }, 3000);
+        }
+
+        window.showAddModal = () => {
+            const modal = document.getElementById('add-schedule-modal');
+            const form = document.getElementById('add-schedule-form');
+            if (form) form.reset();
+            const impVal = document.getElementById('importance-value');
+            if(impVal) impVal.textContent = '50';
+            if(modal) modal.classList.remove('hidden');
+        };
+
+        window.hideAddModal = () => {
+            const modal = document.getElementById('add-schedule-modal');
+            if(modal) modal.classList.add('hidden');
+        };
+
+        // 詳細表示
+        window.showTaskDetail = (taskId) => {
+            const id = Number(taskId);
+            const task = tasks.find(t => t.id === id);
+            if (!task) {
+                showTemporaryMessage("タスクが見つかりませんでした", "bg-red-500");
+                return;
+            }
+
+            const modal = document.getElementById('detail-schedule-modal');
+            const deadline = new Date(task.deadline);
+            const deadlineStr = `${deadline.getFullYear()}年${deadline.getMonth() + 1}月${deadline.getDate()}日 ${deadline.getHours()}:${String(deadline.getMinutes()).padStart(2, '0')}`;
+
+            document.getElementById('detail-name').textContent = task.name;
+            document.getElementById('detail-deadline').textContent = deadlineStr;
+            document.getElementById('detail-importance').textContent = task.importance;
+            document.getElementById('detail-details').textContent = task.details || '詳細情報はありません。';
+
+            // スヌーズボタン
+            const snoozeBtn = document.getElementById('detail-snooze-btn');
+            const now = new Date();
+            const isSnoozed = task.snoozeUntil && new Date(task.snoozeUntil) > now;
+
+            if (snoozeBtn) {
+                if (isSnoozed) {
+                    snoozeBtn.disabled = true;
+                    snoozeBtn.textContent = `スヌーズ中 (${new Date(task.snoozeUntil).toLocaleTimeString('ja-JP', {hour:'2-digit', minute:'2-digit'})})まで`;
+                    snoozeBtn.classList.add('opacity-50');
+                    snoozeBtn.classList.remove('bg-yellow-600', 'hover:bg-yellow-500');
+                    snoozeBtn.classList.add('bg-gray-500');
+                } else {
+                    snoozeBtn.disabled = false;
+                    snoozeBtn.textContent = `スヌーズ (2h)`;
+                    snoozeBtn.classList.add('bg-yellow-600', 'hover:bg-yellow-500');
+                    snoozeBtn.classList.remove('opacity-50', 'bg-gray-500');
+                    snoozeBtn.onclick = () => window.snoozeTask(id);
+                }
+            }
+
+            // ボタンイベント
+            const compBtn = document.getElementById('detail-complete-btn');
+            if(compBtn) compBtn.onclick = () => window.completeTask(id);
+            
+            const cancelBtn = document.getElementById('detail-cancel-btn');
+            if(cancelBtn) cancelBtn.onclick = () => window.deleteTask(id);
+
+            if(modal) modal.classList.remove('hidden');
+        };
+
+        window.hideDetailModal = () => {
+            const modal = document.getElementById('detail-schedule-modal');
+            if(modal) modal.classList.add('hidden');
+        };
+
+        // --- イベント登録 ---
+        document.addEventListener('DOMContentLoaded', () => {
+            // アプリ起動
+            window.initializeLocalApp();
+
+            // 追加フォーム
+            const addForm = document.getElementById('add-schedule-form');
+            if (addForm) {
+                addForm.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    
+                    const name = document.getElementById('schedule-name').value.trim();
+                    const importance = parseInt(document.getElementById('schedule-importance').value, 10);
+                    const date = document.getElementById('schedule-date').value;
+                    const time = document.getElementById('schedule-time').value;
+                    const details = document.getElementById('schedule-details').value.trim();
+
+                    if (!name || !date || !time) {
+                        showTemporaryMessage("スケジュール名と期限は必須です", "bg-red-500");
+                        return;
+                    }
+
+                    const deadlineDate = new Date(`${date}T${time}:00`);
+                    if (isNaN(deadlineDate)) {
+                        showTemporaryMessage("日時が不正です", "bg-red-500");
+                        return;
+                    }
+
+                    window.addNewTask({
+                        name,
+                        importance,
+                        deadline: deadlineDate.toISOString(),
+                        details
+                    });
+                });
+            }
+
+            // スライダー
+            const slider = document.getElementById('schedule-importance');
+            if(slider) {
+                slider.addEventListener('input', (e) => {
+                    document.getElementById('importance-value').textContent = e.target.value;
+                });
+            }
+
+            // リセット
+            const resetBtn = document.getElementById('reset-add-form-btn');
+            if(resetBtn) {
+                resetBtn.addEventListener('click', () => {
+                    const form = document.getElementById('add-schedule-form');
+                    if(form) form.reset();
+                    document.getElementById('importance-value').textContent = '50';
+                });
+            }
+        });
+    </script>
+
+    <!-- 一時メッセージコンテナ -->
+    <div id="message-container" class="fixed top-0 left-1/2 transform -translate-x-1/2 opacity-0 transition-opacity duration-300 z-50 px-4 py-2 rounded-b-lg shadow-lg"></div>
+
+    <!-- メインコンテンツ -->
+    <div class="container mx-auto p-4 md:p-6 lg:p-8">
+        <header class="text-white text-center mb-6">
+            <h1 class="text-3xl md:text-4xl font-bold mb-1">行動値型タスクキュー</h1>
+            <p class="text-gray-400 text-sm">Action Value Queue: Small value = High Priority (時間計算は30分単位で丸め)</p>
+            <div id="user-id-display" class="text-xs text-gray-500 mt-1 truncate">Status: Loading...</div>
+        </header>
+        
+        <!-- Loadingメッセージ -->
+        <div id="loading-container" class="text-center mb-4">
+             <p class="text-gray-400 text-center mt-12" id="initial-loading-message">タスクデータをロード中...</p>
+        </div>
+
+        <!-- タスクリスト (キュー) -->
+        <div id="task-list" class="space-y-3 pb-24">
+            <!-- タスクブロックがここに挿入されます -->
+        </div>
+
+        <!-- スケジュール追加ボタン (フッター/余白部分) -->
+        <div class="fixed bottom-0 left-0 right-0 p-4 bg-gray-800 bg-opacity-90 shadow-2xl rounded-t-xl z-20">
+            <button 
+                id="add-schedule-btn" 
+                onclick="window.showAddModal()"
+                class="w-full h-12 flex items-center justify-center bg-green-600 hover:bg-green-700 text-white text-xl font-bold rounded-full shadow-lg transition duration-200 transform hover:scale-105"
+            >
+                <i class="fas fa-plus mr-2"></i> スケジュールを追加
+            </button>
+        </div>
+    </div>
+    
+    <!-- 1. スケジュール追加ウィンドウ (モーダル) -->
+    <div id="add-schedule-modal" class="modal-overlay fixed inset-0 hidden flex items-center justify-center p-4">
+        <div class="modal-content bg-gray-800 text-white rounded-xl shadow-2xl w-full max-w-md p-6">
+            <h2 class="text-2xl font-bold mb-4 border-b border-gray-700 pb-2">新規スケジュール追加</h2>
+            
+            <form id="add-schedule-form">
+                <div class="mb-4">
+                    <label for="schedule-name" class="block text-sm font-medium mb-1">1. スケジュール名</label>
+                    <input type="text" id="schedule-name" class="w-full p-2 rounded bg-gray-700 border border-gray-600 focus:ring-blue-500 focus:border-blue-500" required>
+                </div>
+                
+                <div class="mb-4">
+                    <label for="schedule-importance" class="block text-sm font-medium mb-2">2. 重要度 (1〜100)</label>
+                    <div class="flex items-center space-x-3">
+                        <span class="text-sm">低 (1)</span>
+                        <input type="range" id="schedule-importance" min="1" max="100" value="50" class="flex-grow h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer range-lg">
+                        <span id="importance-value" class="font-bold text-lg w-10 text-right">50</span>
+                    </div>
+                </div>
+
+                <div class="mb-4 flex space-x-4">
+                    <div class="flex-1">
+                        <label for="schedule-date" class="block text-sm font-medium mb-1">3. 期限 (年月日)</label>
+                        <!-- カレンダー表示での入力 (HTML標準のdate input) -->
+                        <input type="date" id="schedule-date" class="w-full p-2 rounded bg-gray-700 border border-gray-600" required>
+                    </div>
+                    <div class="flex-1">
+                        <label for="schedule-time" class="block text-sm font-medium mb-1">期限 (時間)</label>
+                        <!-- ホイール形式 (HTML標準のtime input) -->
+                        <input type="time" id="schedule-time" value="09:00" class="w-full p-2 rounded bg-gray-700 border border-gray-600" required>
+                    </div>
+                </div>
+
+                <div class="mb-6">
+                    <label for="schedule-details" class="block text-sm font-medium mb-1">4. スケジュール詳細 (非表示)</label>
+                    <textarea id="schedule-details" rows="3" class="w-full p-2 rounded bg-gray-700 border border-gray-600" placeholder="タスクの具体的な内容やメモ"></textarea>
+                </div>
+
+                <!-- ボタン群 -->
+                <div class="flex justify-between space-x-2">
+                    <button type="button" id="reset-add-form-btn" class="flex-1 py-2 px-4 rounded-lg bg-gray-600 hover:bg-gray-500 text-white font-semibold transition duration-150">
+                        <i class="fas fa-undo"></i> 元に戻る
+                    </button>
+                    <button type="button" onclick="window.hideAddModal()" class="flex-1 py-2 px-4 rounded-lg bg-red-600 hover:bg-red-500 text-white font-semibold transition duration-150">
+                        <i class="fas fa-times"></i> 取り消し
+                    </button>
+                    <button type="submit" class="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition duration-150">
+                        <i class="fas fa-check"></i> 確定
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+    
+    <!-- 2. ブロック詳細ウィンドウ (モーダル) -->
+    <div id="detail-schedule-modal" class="modal-overlay fixed inset-0 hidden flex items-center justify-center p-4">
+        <div class="modal-content bg-gray-800 text-white rounded-xl shadow-2xl w-full max-w-md p-6">
+            <h2 class="text-2xl font-bold mb-4 border-b border-gray-700 pb-2" id="detail-name"></h2>
+            
+            <div class="space-y-3 mb-6">
+                <!-- 設定した時刻 -->
+                <div class="p-3 bg-gray-700 rounded-lg">
+                    <span class="text-sm text-gray-400 block">設定した期限</span>
+                    <span id="detail-deadline" class="text-lg font-semibold"></span>
+                </div>
+                
+                <!-- 重要度 -->
+                <div class="p-3 bg-gray-700 rounded-lg">
+                    <span class="text-sm text-gray-400 block">重要度</span>
+                    <span id="detail-importance" class="text-lg font-semibold"></span> / 100
+                </div>
+
+                <!-- 詳細 (基本は非表示、クリックで表示) -->
+                <div class="p-3 bg-gray-700 rounded-lg">
+                    <span class="text-sm text-gray-400 block">詳細情報</span>
+                    <p id="detail-details" class="whitespace-pre-wrap text-sm"></p>
+                </div>
+            </div>
+
+            <!-- ボタン群 -->
+            <div class="space-y-2">
+                <button type="button" id="detail-snooze-btn" class="w-full py-3 rounded-lg bg-yellow-600 hover:bg-yellow-500 text-gray-900 font-bold transition duration-150">
+                    <i class="fas fa-bell-slash"></i> スヌーズ (2h)
+                </button>
+                <button type="button" id="detail-complete-btn" class="w-full py-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold transition duration-150">
+                    <i class="fas fa-check-circle"></i> スケジュール完了
+                </button>
+                <button type="button" id="detail-cancel-btn" class="w-full py-3 rounded-lg bg-red-600 hover:bg-red-500 text-white font-bold transition duration-150">
+                    <i class="fas fa-trash"></i> スケジュール取り消し
+                </button>
+                <button type="button" onclick="window.hideDetailModal()" class="w-full py-3 rounded-lg bg-gray-600 hover:bg-gray-500 text-white font-bold transition duration-150 mt-4">
+                    <i class="fas fa-times"></i> 詳細表示終了
+                </button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
