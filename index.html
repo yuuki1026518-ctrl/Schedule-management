@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>行動値型ゲームスケジューラ (ローカル保存)</title>
+    <title>行動値型タスクキュー (改善版)</title>
     <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Inter Font -->
@@ -23,7 +23,7 @@
             background-color: #1f2937; /* Dark background for game feel */
         }
         .task-block {
-            transition: all 0.5s ease-in-out, transform 0.3s ease-out; /* 移動と浮き上がりアニメーション */
+            transition: all 0.5s ease-in-out, transform 0.3s ease-out; 
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
             cursor: pointer;
             position: relative;
@@ -31,7 +31,7 @@
         /* 行動値に応じた色分け */
         .color-0 { background-color: #dc2626; color: white; } /* Overdue (Deep Red) */
         .color-1 { background-color: var(--color-urgent); color: white; } /* High Priority (Red) */
-        .color-2 { background-color: var(--color-important); color: white; } /* Medium Priority (Orange) */
+        .color-2 { background-color: var(--color-important); color: white; } /* Mid Priority (Orange) */
         .color-3 { background-color: var(--color-normal); color: #1f2937; } /* Normal Priority (Yellow) */
         .color-4 { background-color: var(--color-low); color: #1f2937; } /* Low Priority (White/Gray) */
 
@@ -41,7 +41,7 @@
             z-index: 10;
         }
 
-        /* スケジュール詳細モーダル */
+        /* モーダル */
         .modal-overlay {
             background-color: rgba(0, 0, 0, 0.7);
             z-index: 50;
@@ -50,30 +50,99 @@
             max-height: 90vh;
             overflow-y: auto;
         }
+
+        /* 行動値の列幅を固定し、文字の被りを防ぐ */
+        .action-value-col {
+            min-width: 6rem; /* 確保する最小幅 (約96px) */
+            flex-shrink: 0;
+        }
+
+        /* スマホ向けボタンのサイズ調整 */
+        .responsive-btn {
+            padding-top: 0.75rem; /* py-3 相当 */
+            padding-bottom: 0.75rem; /* py-3 相当 */
+            font-size: 1rem; /* text-base 相当 */
+        }
+        @media (min-width: 640px) {
+            .responsive-btn {
+                padding-top: 0.5rem; /* sm:py-2 相当 */
+                padding-bottom: 0.5rem; /* sm:py-2 相当 */
+                font-size: 1.125rem; /* sm:text-lg 相当 */
+            }
+        }
     </style>
 </head>
 <body class="min-h-screen">
-    <!-- インメモリ + LocalStorageロジック -->
     <script>
         // --- グローバル変数 ---
-        let tasks = [];     // タスクを保存する配列
-        let nextId = 1;     // タスクID用カウンタ
+        let tasks = [];     
+        let nextId = 1;     
         let updateInterval = null;
-        const STORAGE_KEY = 'actionValueScheduler_tasks_v1'; // ローカルストレージのキー
+        const STORAGE_KEY = 'actionValueScheduler_tasks_v2'; // localStorageのキー
 
-        // グローバル関数として公開
-        window.initializeLocalApp = initializeLocalApp;
-        window.refreshTaskView = refreshTaskView;
-        window.addNewTask = addNewTask;
-        window.deleteTask = deleteTask;
-        window.completeTask = completeTask;
-        window.snoozeTask = snoozeTask;
-        window.calculateActionValue = calculateActionValue;
-        window.saveData = saveData; // 保存用関数
+        // --- 改善された行動値計算ロジック ---
 
         /**
-         * アプリの初期化
+         * 30分単位で時間を丸め、行動値を計算する関数
+         * (改善点5: 重要度100で0になるのを回避するため、係数を 101-importance に修正)
+         * @param {number} importance - 1から100の重要度
+         * @param {Date} deadline - 期限のDateオブジェクト
+         * @returns {number} 行動値
          */
+        function calculateActionValue(importance, deadline, boostValue = 0) {
+            const now = new Date();
+            const timeDiffMs = deadline.getTime() - now.getTime();
+            // 分単位での残り時間
+            let T_minutes = timeDiffMs / (1000 * 60); 
+
+            // 30分の倍数で丸める
+            let T_rounded_minutes = Math.round(T_minutes / 30) * 30;
+            const T = T_rounded_minutes / 60; // 時間単位 T
+
+            let actionValue;
+            // 重要度が100でも1以上の係数を持つように 101 - importance を使用
+            const importanceCoefficient = 101 - importance; 
+
+            if (T < 0) {
+                // 遅延したタスク: 行動値 = -10000 * (1 + |T|) - (101 - importance) + α
+                const T_abs = Math.abs(T);
+                actionValue = (-10000 * (1 + T_abs)) - importanceCoefficient + boostValue;
+            } else {
+                // 期限内のタスク: 行動値 = (101 - importance) * (T + 1) + α
+                actionValue = importanceCoefficient * (T + 1) + boostValue;
+            }
+            
+            // 改善点6: 小数点第一位で四捨五入した整数値を返す
+            return Math.round(actionValue);
+        }
+        
+        /**
+         * 改善点7: 行動値をk, M表記で整形する
+         * @param {number} value - 行動値の数値
+         * @returns {string} 整形された文字列
+         */
+        function formatActionValue(value) {
+            const absValue = Math.abs(value);
+            const sign = value < 0 ? '-' : '';
+
+            if (absValue >= 1000000) {
+                // 100万以上はM表記
+                return sign + (absValue / 1000000).toFixed(1) + 'M';
+            } else if (absValue >= 1000) {
+                // 1000以上はk表記 (小数点第一位まで表示、ただし100kのように整数部分が多い場合は整数)
+                const num = absValue / 1000;
+                // 100k未満は小数、それ以上は整数
+                if (num < 100) {
+                     return sign + num.toFixed(1) + 'k';
+                }
+                return sign + Math.round(num) + 'k';
+            }
+            // 1000未満はそのまま
+            return value.toString();
+        }
+
+        // --- データ永続化と初期化 ---
+        
         function initializeLocalApp() {
             const userIdDisplay = document.getElementById('user-id-display');
             const loadingMsg = document.getElementById('initial-loading-message');
@@ -82,14 +151,11 @@
                 userIdDisplay.textContent = 'Status: ローカル保存モード (ブラウザに保存中)';
             }
 
-            // --- データのロード処理 ---
             const savedData = localStorage.getItem(STORAGE_KEY);
             if (savedData) {
                 try {
                     tasks = JSON.parse(savedData);
-                    // IDの整合性を保つため、最大のIDを探してnextIdを更新
                     if (tasks.length > 0) {
-                        // 文字列IDが混ざる可能性を考慮して数値変換
                         const maxId = Math.max(...tasks.map(t => Number(t.id)));
                         if (!isNaN(maxId)) {
                             nextId = maxId + 1;
@@ -100,102 +166,80 @@
                     tasks = [];
                 }
             }
-            // -----------------------
             
-            // 初回描画
             refreshTaskView();
 
-            // ローディングメッセージを適切なものに変更
             if (loadingMsg) {
                 if (tasks.length === 0) {
                     loadingMsg.textContent = 'タスクはまだありません。右下のボタンからスケジュールを追加しましょう！';
-                    loadingMsg.classList.remove('text-red-400');
+                    loadingMsg.classList.remove('text-red-400', 'hidden');
                     loadingMsg.classList.add('text-gray-400');
-                    loadingMsg.classList.remove('hidden');
                 } else {
                     loadingMsg.classList.add('hidden');
                 }
             }
 
-            // 1分ごとにタスクの行動値（残り時間に基づく）を再計算して表示更新
             if (updateInterval) clearInterval(updateInterval);
-            updateInterval = setInterval(refreshTaskView, 60000);
+            // 1分ごとに更新
+            updateInterval = setInterval(refreshTaskView, 60000); 
         }
 
-        /**
-         * データをローカルストレージに保存
-         */
         function saveData() {
             try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
-                console.log("データを保存しました");
             } catch (e) {
-                console.error("保存に失敗しました（容量オーバーなどの可能性があります）", e);
+                console.error("保存に失敗しました", e);
                 showTemporaryMessage("保存に失敗しました", "bg-red-500");
             }
         }
 
         /**
-         * 30分単位で時間を丸め、行動値を計算する関数
+         * 改善点3: 残り時間表示を日本語化 (X日Y時間)
          */
-        function calculateActionValue(importance, deadline, boostValue = 0) {
-            const now = new Date();
-            const timeDiffMs = deadline.getTime() - now.getTime();
-            // 分単位での残り時間
-            let T_minutes = timeDiffMs / (1000 * 60); 
+        function formatTimeRemaining(deadline) {
+            const timeDiffMs = new Date(deadline).getTime() - new Date().getTime();
+            const T_minutes = timeDiffMs / (1000 * 60);
+            const T_rounded_minutes = Math.round(T_minutes / 30) * 30;
+            const T_hours = T_rounded_minutes / 60;
 
-            // --- 30分単位の丸め処理 (四捨五入) ---
-            let T_rounded_minutes = Math.round(T_minutes / 30) * 30;
-
-            // 丸められた時間を時間単位 T に変換
-            const T = T_rounded_minutes / 60; 
-
-            let actionValue;
-
-            if (T < 0) {
-                // 遅延したタスク
-                const T_abs = Math.abs(T);
-                actionValue = (-10000 * (1 + T_abs)) - importance + boostValue;
+            if (T_hours < 0) {
+                const totalHoursOverdue = Math.abs(T_hours);
+                const daysOverdue = Math.floor(totalHoursOverdue / 24);
+                const hoursOverdue = totalHoursOverdue % 24;
+                // 遅延時間は小数点以下は切り捨て
+                const hoursDisplay = Math.floor(hoursOverdue); 
+                return `<span class="font-bold">遅延: ${daysOverdue}日 ${hoursDisplay}時間</span>`;
             } else {
-                // 期限内のタスク
-                actionValue = (100 - importance) * (T + 1) + boostValue;
+                const totalHours = T_hours;
+                const days = Math.floor(totalHours / 24);
+                const hours = totalHours % 24;
+                // 30分単位で丸められているため、0.5時間も表示
+                return `${days}日 ${hours.toFixed(1).replace('.0', '')}時間`;
             }
-            
-            return Math.round(actionValue * 10) / 10;
         }
 
-        /**
-         * タスクリストの再計算と表示更新
-         */
         function refreshTaskView() {
             const now = new Date();
             let hasChanges = false;
 
-            // 1. 各タスクの行動値を再計算
             tasks.forEach(task => {
-                // スヌーズ期限切れチェック
                 if (task.snoozeUntil && new Date(task.snoozeUntil) <= now) {
                     task.boostValue = 0;
                     task.snoozeUntil = null;
-                    hasChanges = true; // 状態が変わったので保存が必要
+                    hasChanges = true; 
                 }
                 
-                // Dateオブジェクトであることを保証
                 const deadlineDate = new Date(task.deadline);
                 task.actionValue = calculateActionValue(task.importance, deadlineDate, task.boostValue || 0);
             });
 
             if (hasChanges) {
-                saveData(); // スヌーズ解除などを保存
+                saveData(); 
             }
 
-            // 2. 行動値が小さい順にソート
             tasks.sort((a, b) => a.actionValue - b.actionValue);
-
-            // 3. 描画
             renderTasks(tasks);
 
-            // 4. 空状態の表示制御
             const loadingMessage = document.getElementById('initial-loading-message');
             if (loadingMessage) {
                 if (tasks.length === 0) {
@@ -207,13 +251,12 @@
         }
 
         /**
-         * HTMLレンダリング
+         * HTMLレンダリング (改善点2: レイアウト調整)
          */
         function renderTasks(sortedTasks) {
             const container = document.getElementById('task-list');
             if (!container) return;
 
-            // アニメーション判定用
             const currentElements = Array.from(container.children);
             const currentTaskIds = currentElements.map(el => el.dataset.taskId).filter(id => id);
 
@@ -223,46 +266,35 @@
                 const taskIdStr = String(task.id);
                 const isMoving = currentTaskIds[index] !== taskIdStr && currentTaskIds.includes(taskIdStr);
 
-                // 色分け
                 let colorClass;
-                if (task.actionValue < 0) colorClass = 'color-0';      // Overdue
-                else if (task.actionValue < 50) colorClass = 'color-1'; // High
-                else if (task.actionValue < 200) colorClass = 'color-2'; // Mid
-                else if (task.actionValue < 500) colorClass = 'color-3'; // Normal
-                else colorClass = 'color-4'; // Low
+                if (task.actionValue < 0) colorClass = 'color-0';
+                else if (task.actionValue < 50) colorClass = 'color-1';
+                else if (task.actionValue < 200) colorClass = 'color-2';
+                else if (task.actionValue < 500) colorClass = 'color-3';
+                else colorClass = 'color-4';
 
-                // 残り時間表示計算
-                const timeDiffMs = new Date(task.deadline).getTime() - new Date().getTime();
-                const T_minutes = timeDiffMs / (1000 * 60);
-                const T_rounded_minutes = Math.round(T_minutes / 30) * 30;
-                const T_hours = T_rounded_minutes / 60;
-
-                let timeRemainingStr;
-                if (T_hours < 0) {
-                    const totalHoursOverdue = Math.abs(T_hours);
-                    const daysOverdue = Math.floor(totalHoursOverdue / 24);
-                    const hoursOverdue = Math.round((totalHoursOverdue % 24) * 2) / 2;
-                    timeRemainingStr = `<span class="font-bold">遅延: ${daysOverdue}d ${hoursOverdue}h</span>`;
-                } else {
-                    const days = Math.floor(T_hours / 24);
-                    const hours = Math.round((T_hours % 24) * 2) / 2;
-                    timeRemainingStr = `${days}d ${hours}h`;
-                }
+                const timeRemainingStr = formatTimeRemaining(task.deadline);
+                const actionValueDisplay = formatActionValue(task.actionValue);
 
                 html += `
                     <div 
                         data-task-id="${task.id}" 
                         data-action-value="${task.actionValue}"
-                        class="task-block ${colorClass} ${isMoving ? 'is-moving' : ''} p-4 mb-3 rounded-lg flex justify-between items-center transition-all duration-500 ease-in-out"
+                        class="task-block ${colorClass} ${isMoving ? 'is-moving' : ''} p-4 mb-3 rounded-lg flex items-center transition-all duration-500 ease-in-out"
                         onclick="window.showTaskDetail('${task.id}')"
                     >
-                        <div class="text-lg font-extrabold w-1/5 text-center p-1 rounded-md bg-opacity-30">
-                            ${task.actionValue.toFixed(1)}
+                        <!-- 行動値 (改善点2: 固定幅) -->
+                        <div class="action-value-col text-lg md:text-xl font-extrabold text-center p-1 rounded-md bg-opacity-30 flex-shrink-0">
+                            ${actionValueDisplay}
                         </div>
-                        <div class="font-semibold text-base w-3/5 truncate px-2">
+                        
+                        <!-- スケジュール名 -->
+                        <div class="font-semibold text-base md:text-lg flex-grow truncate px-2">
                             ${task.name}
                         </div>
-                        <div class="text-sm w-1/5 text-right flex-shrink-0">
+                        
+                        <!-- 残り時間 -->
+                        <div class="text-xs md:text-sm text-right flex-shrink-0 min-w-[7rem]">
                             ${timeRemainingStr}
                         </div>
                     </div>
@@ -278,9 +310,8 @@
             }, 300);
         }
 
-        /**
-         * タスク追加
-         */
+        // --- CRUD操作 ---
+        
         function addNewTask(taskData) {
             const newTask = {
                 id: nextId++,
@@ -293,39 +324,30 @@
             };
             
             tasks.push(newTask);
-            saveData(); // 保存を実行
+            saveData();
             refreshTaskView();
             window.hideAddModal();
             showTemporaryMessage("タスクが追加されました！", "bg-green-500");
         }
 
-        /**
-         * タスク削除
-         */
         function deleteTask(taskId) {
             const id = Number(taskId);
             const initialLen = tasks.length;
             tasks = tasks.filter(t => t.id !== id);
 
             if (tasks.length < initialLen) {
-                saveData(); // 保存を実行
+                saveData(); 
                 window.hideDetailModal();
                 refreshTaskView();
                 showTemporaryMessage("タスクがキャンセルされました", "bg-red-500");
             }
         }
 
-        /**
-         * タスク完了
-         */
         function completeTask(taskId) {
-            deleteTask(taskId); // 現状は削除と同じ扱い
-            showTemporaryMessage("タスクを完了しました！お疲れ様です！", "bg-blue-500");
+            deleteTask(taskId); 
+            showTemporaryMessage("タスクを完了しました！お疲れ様です！", "bg-blue-600");
         }
 
-        /**
-         * スヌーズ機能
-         */
         function snoozeTask(taskId) {
             const id = Number(taskId);
             const task = tasks.find(t => t.id === id);
@@ -334,14 +356,14 @@
                 task.boostValue = 3000;
                 task.snoozeUntil = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
                 
-                saveData(); // 保存を実行
+                saveData(); 
                 window.hideDetailModal();
                 refreshTaskView();
-                showTemporaryMessage("タスクを2時間スヌーズしました。", "bg-yellow-500");
+                showTemporaryMessage("タスクを2時間スヌーズしました。", "bg-yellow-600");
             }
         }
 
-        // --- 汎用・UI制御 ---
+        // --- UI制御 ---
 
         function showTemporaryMessage(message, bgColor) {
             const container = document.getElementById('message-container');
@@ -370,7 +392,6 @@
             if(modal) modal.classList.add('hidden');
         };
 
-        // 詳細表示
         window.showTaskDetail = (taskId) => {
             const id = Number(taskId);
             const task = tasks.find(t => t.id === id);
@@ -388,7 +409,7 @@
             document.getElementById('detail-importance').textContent = task.importance;
             document.getElementById('detail-details').textContent = task.details || '詳細情報はありません。';
 
-            // スヌーズボタン
+            // スヌーズボタンの状態更新
             const snoozeBtn = document.getElementById('detail-snooze-btn');
             const now = new Date();
             const isSnoozed = task.snoozeUntil && new Date(task.snoozeUntil) > now;
@@ -409,7 +430,6 @@
                 }
             }
 
-            // ボタンイベント
             const compBtn = document.getElementById('detail-complete-btn');
             if(compBtn) compBtn.onclick = () => window.completeTask(id);
             
@@ -426,10 +446,8 @@
 
         // --- イベント登録 ---
         document.addEventListener('DOMContentLoaded', () => {
-            // アプリ起動
             window.initializeLocalApp();
 
-            // 追加フォーム
             const addForm = document.getElementById('add-schedule-form');
             if (addForm) {
                 addForm.addEventListener('submit', (e) => {
@@ -461,7 +479,6 @@
                 });
             }
 
-            // スライダー
             const slider = document.getElementById('schedule-importance');
             if(slider) {
                 slider.addEventListener('input', (e) => {
@@ -469,7 +486,6 @@
                 });
             }
 
-            // リセット
             const resetBtn = document.getElementById('reset-add-form-btn');
             if(resetBtn) {
                 resetBtn.addEventListener('click', () => {
@@ -504,10 +520,11 @@
 
         <!-- スケジュール追加ボタン (フッター/余白部分) -->
         <div class="fixed bottom-0 left-0 right-0 p-4 bg-gray-800 bg-opacity-90 shadow-2xl rounded-t-xl z-20">
+            <!-- 改善点4: スマホで押しやすい大きなボタン -->
             <button 
                 id="add-schedule-btn" 
                 onclick="window.showAddModal()"
-                class="w-full h-12 flex items-center justify-center bg-green-600 hover:bg-green-700 text-white text-xl font-bold rounded-full shadow-lg transition duration-200 transform hover:scale-105"
+                class="w-full h-14 flex items-center justify-center bg-green-600 hover:bg-green-700 text-white text-xl font-bold rounded-full shadow-lg transition duration-200 transform hover:scale-105 responsive-btn"
             >
                 <i class="fas fa-plus mr-2"></i> スケジュールを追加
             </button>
@@ -520,9 +537,10 @@
             <h2 class="text-2xl font-bold mb-4 border-b border-gray-700 pb-2">新規スケジュール追加</h2>
             
             <form id="add-schedule-form">
+                <!-- 入力フィールドのフォントサイズ調整 -->
                 <div class="mb-4">
                     <label for="schedule-name" class="block text-sm font-medium mb-1">1. スケジュール名</label>
-                    <input type="text" id="schedule-name" class="w-full p-2 rounded bg-gray-700 border border-gray-600 focus:ring-blue-500 focus:border-blue-500" required>
+                    <input type="text" id="schedule-name" class="w-full p-3 rounded bg-gray-700 border border-gray-600 focus:ring-blue-500 focus:border-blue-500 text-base" required>
                 </div>
                 
                 <div class="mb-4">
@@ -537,30 +555,28 @@
                 <div class="mb-4 flex space-x-4">
                     <div class="flex-1">
                         <label for="schedule-date" class="block text-sm font-medium mb-1">3. 期限 (年月日)</label>
-                        <!-- カレンダー表示での入力 (HTML標準のdate input) -->
-                        <input type="date" id="schedule-date" class="w-full p-2 rounded bg-gray-700 border border-gray-600" required>
+                        <input type="date" id="schedule-date" class="w-full p-3 rounded bg-gray-700 border border-gray-600 text-base" required>
                     </div>
                     <div class="flex-1">
                         <label for="schedule-time" class="block text-sm font-medium mb-1">期限 (時間)</label>
-                        <!-- ホイール形式 (HTML標準のtime input) -->
-                        <input type="time" id="schedule-time" value="09:00" class="w-full p-2 rounded bg-gray-700 border border-gray-600" required>
+                        <input type="time" id="schedule-time" value="09:00" class="w-full p-3 rounded bg-gray-700 border border-gray-600 text-base" required>
                     </div>
                 </div>
 
                 <div class="mb-6">
                     <label for="schedule-details" class="block text-sm font-medium mb-1">4. スケジュール詳細 (非表示)</label>
-                    <textarea id="schedule-details" rows="3" class="w-full p-2 rounded bg-gray-700 border border-gray-600" placeholder="タスクの具体的な内容やメモ"></textarea>
+                    <textarea id="schedule-details" rows="3" class="w-full p-3 rounded bg-gray-700 border border-gray-600 text-base" placeholder="タスクの具体的な内容やメモ"></textarea>
                 </div>
 
-                <!-- ボタン群 -->
+                <!-- ボタン群 (改善点4: スマホで押しやすい大きなボタン) -->
                 <div class="flex justify-between space-x-2">
-                    <button type="button" id="reset-add-form-btn" class="flex-1 py-2 px-4 rounded-lg bg-gray-600 hover:bg-gray-500 text-white font-semibold transition duration-150">
+                    <button type="button" id="reset-add-form-btn" class="flex-1 rounded-lg bg-gray-600 hover:bg-gray-500 text-white font-semibold transition duration-150 responsive-btn">
                         <i class="fas fa-undo"></i> 元に戻る
                     </button>
-                    <button type="button" onclick="window.hideAddModal()" class="flex-1 py-2 px-4 rounded-lg bg-red-600 hover:bg-red-500 text-white font-semibold transition duration-150">
+                    <button type="button" onclick="window.hideAddModal()" class="flex-1 rounded-lg bg-red-600 hover:bg-red-500 text-white font-semibold transition duration-150 responsive-btn">
                         <i class="fas fa-times"></i> 取り消し
                     </button>
-                    <button type="submit" class="flex-1 py-2 px-4 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition duration-150">
+                    <button type="submit" class="flex-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition duration-150 responsive-btn">
                         <i class="fas fa-check"></i> 確定
                     </button>
                 </div>
@@ -574,37 +590,34 @@
             <h2 class="text-2xl font-bold mb-4 border-b border-gray-700 pb-2" id="detail-name"></h2>
             
             <div class="space-y-3 mb-6">
-                <!-- 設定した時刻 -->
                 <div class="p-3 bg-gray-700 rounded-lg">
                     <span class="text-sm text-gray-400 block">設定した期限</span>
                     <span id="detail-deadline" class="text-lg font-semibold"></span>
                 </div>
                 
-                <!-- 重要度 -->
                 <div class="p-3 bg-gray-700 rounded-lg">
                     <span class="text-sm text-gray-400 block">重要度</span>
                     <span id="detail-importance" class="text-lg font-semibold"></span> / 100
                 </div>
 
-                <!-- 詳細 (基本は非表示、クリックで表示) -->
                 <div class="p-3 bg-gray-700 rounded-lg">
                     <span class="text-sm text-gray-400 block">詳細情報</span>
                     <p id="detail-details" class="whitespace-pre-wrap text-sm"></p>
                 </div>
             </div>
 
-            <!-- ボタン群 -->
+            <!-- ボタン群 (改善点4: スマホで押しやすい大きなボタン) -->
             <div class="space-y-2">
-                <button type="button" id="detail-snooze-btn" class="w-full py-3 rounded-lg bg-yellow-600 hover:bg-yellow-500 text-gray-900 font-bold transition duration-150">
+                <button type="button" id="detail-snooze-btn" class="w-full rounded-lg bg-yellow-600 hover:bg-yellow-500 text-gray-900 font-bold transition duration-150 responsive-btn">
                     <i class="fas fa-bell-slash"></i> スヌーズ (2h)
                 </button>
-                <button type="button" id="detail-complete-btn" class="w-full py-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold transition duration-150">
+                <button type="button" id="detail-complete-btn" class="w-full rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-bold transition duration-150 responsive-btn">
                     <i class="fas fa-check-circle"></i> スケジュール完了
                 </button>
-                <button type="button" id="detail-cancel-btn" class="w-full py-3 rounded-lg bg-red-600 hover:bg-red-500 text-white font-bold transition duration-150">
+                <button type="button" id="detail-cancel-btn" class="w-full rounded-lg bg-red-600 hover:bg-red-500 text-white font-bold transition duration-150 responsive-btn">
                     <i class="fas fa-trash"></i> スケジュール取り消し
                 </button>
-                <button type="button" onclick="window.hideDetailModal()" class="w-full py-3 rounded-lg bg-gray-600 hover:bg-gray-500 text-white font-bold transition duration-150 mt-4">
+                <button type="button" onclick="window.hideDetailModal()" class="w-full rounded-lg bg-gray-600 hover:bg-gray-500 text-white font-bold transition duration-150 mt-4 responsive-btn">
                     <i class="fas fa-times"></i> 詳細表示終了
                 </button>
             </div>
